@@ -1,14 +1,11 @@
 """`kedro_viz.api.rest.router` defines REST routes and handling logic."""
 
-import uuid
-import threading
+import asyncio
 import logging
-import subprocess
-from datetime import datetime
+import queue
+
 from fastapi import APIRouter, BackgroundTasks
-from fastapi.responses import JSONResponse
-import os
-import signal
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from kedro_viz.api.rest.requests import (
     DeployerConfiguration,
@@ -38,6 +35,14 @@ from kedro_viz.api.rest.responses.env import (
     EnvironmentAPIResponse,
     get_env_response,
 )
+from pathlib import Path
+
+from kedro_viz.api.rest.runner.models import RunConfig
+from kedro_viz.api.rest.runner.store import JobStore
+from kedro_viz.api.rest.runner.executor import PipelineExecutor
+from kedro_viz.api.rest.runner.progress import ProgressTracker
+from kedro_viz.api.rest.runner.service import ActiveJobError, RunnerService
+from kedro_viz.api.rest.runner.events import SSEFormatter
 
 logger = logging.getLogger(__name__)
 
@@ -167,114 +172,57 @@ async def deploy_kedro_viz(input_values: DeployerConfiguration):
         return JSONResponse(status_code=500, content={"message": f"{exc}"})
 
 
-kedro_jobs = {}
-_kedro_jobs_lock = threading.Lock()
+job_store = JobStore(storage_dir=Path(".viz/runner_jobs"))
+progress_tracker = ProgressTracker()
+executor = PipelineExecutor(job_store, progress_tracker=progress_tracker)
+runner_service = RunnerService(store=job_store, executor=executor)
 
 
-def _stream_reader(pipe, job_id, key):
-    try:
-        # iter(..., "") yields lines until EOF; returns "" at EOF (not None)
-        for line in iter(pipe.readline, ""):
-            if not line:
-                break
-            with _kedro_jobs_lock:
-                # ensure key exists and is a string
-                kedro_jobs[job_id][key] += line
-    finally:
-        pass 
-
-
-def quote_if_needed(text:str) -> str:
-    if " " in text:
-        return f'"{text}"'
-    return text
-
-def run_kedro_subprocess(job_id, cmd):
-    logger.info("Running Kedro command: %s", cmd)
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    logger.info("Started Kedro command with PID: %s", process.pid)
-
-    # store pid & running status
-    with _kedro_jobs_lock:
-        kedro_jobs[job_id]["pid"] = process.pid
-        kedro_jobs[job_id]["status"] = "running"
-
-    # start reader threads to update kedro_jobs while the process runs
-    t_out = threading.Thread(
-        target=_stream_reader, args=(process.stdout, job_id, "stdout"), daemon=True
-    )
-    t_err = threading.Thread(
-        target=_stream_reader, args=(process.stderr, job_id, "stderr"), daemon=True
-    )
-    t_out.start()
-    t_err.start()
-
-    # wait for the process to finish
-    # (this runs inside the background task, not blocking main request)
-    returncode = process.wait()
-
-    # join reader threads briefly to collect remaining output
-    t_out.join(timeout=1)
-    t_err.join(timeout=1)
-
-    # final collect (communicate to ensure no left-over data)
-    try:
-        rem_out, rem_err = process.communicate(timeout=0.1)
-    except Exception:
-        rem_out, rem_err = "", ""
-
-    with _kedro_jobs_lock:
-        if rem_out:
-            kedro_jobs[job_id]["stdout"] += rem_out
-        if rem_err:
-            kedro_jobs[job_id]["stderr"] += rem_err
-        kedro_jobs[job_id]["returncode"] = returncode
-        kedro_jobs[job_id]["status"] = "finished" if returncode == 0 else "error"
-        kedro_jobs[job_id]["end_time"] = datetime.now()
-        if kedro_jobs[job_id]["start_time"]:
-            kedro_jobs[job_id]["duration"] = (
-                kedro_jobs[job_id]["end_time"] - kedro_jobs[job_id]["start_time"]
-            ).total_seconds()
-
-    logger.info("Kedro job %s finished with return code %d", job_id, returncode)
-
-
+# TODO: Remove this endpoint after frontend migration to POST /api/run is complete.
+# The old endpoint is retained temporarily for backward compatibility.
+# When removing, also delete `validate_raw_command` from validator.py and
+# `start_raw_run` from service.py.
 @router.post("/run-kedro-command")
 async def run_kedro_command(command: str, background_tasks: BackgroundTasks):
     """
     Run a Kedro command provided as a string in a subprocess and return the output.
     Example request body: {"command": "run --pipeline=my_pipeline"}
+
+    .. deprecated::
+        Use POST /api/run with a structured RunConfig body instead.
     """
-    # Split the command string safely
-    import shlex
-
-    job_id = str(uuid.uuid4())
-
-    cmd = shlex.split(command)
-    if not cmd[0] == "kedro":
-        cmd = ["kedro"] + cmd
-
-    # Initialize job status
-    kedro_jobs[job_id] = {
-        "status": "initialize",
-        "start_time": datetime.now(),
-        "cmd": " ".join([quote_if_needed(c) for c in cmd]),
-        "duration": None,
-        "end_time": None,
-        "stdout": "",
-        "stderr": "",
-        "returncode": None,
-    }
-    background_tasks.add_task(run_kedro_subprocess, job_id, cmd)
-    return JSONResponse(
-        status_code=202,
-        content={"job_id": job_id, "status": "initialize"},
+    logger.warning(
+        "Deprecated endpoint called: POST /api/run-kedro-command. "
+        "Use POST /api/run instead."
     )
+    try:
+        job, cmd = runner_service.start_raw_run(command)
+    except ActiveJobError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "message": "A run is already active",
+                "active_job_id": exc.active_job_id,
+                "started_at": exc.started_at.isoformat(),
+            },
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Command validation failed", "errors": str(exc).split("; ")},
+        )
+
+    background_tasks.add_task(runner_service.executor.start, job.job_id, cmd)
+    response = JSONResponse(
+        status_code=202,
+        content={
+            "job_id": job.job_id,
+            "status": "initialize",
+            "_deprecated": "Use POST /api/run instead",
+        },
+    )
+    response.headers["Deprecation"] = "true"
+    return response
 
 
 @router.get("/kedro-command-status/{job_id}")
@@ -282,27 +230,28 @@ async def get_kedro_command_status(job_id: str):
     """
     Get the status of a previously run Kedro command.
     """
-    job = kedro_jobs.get(job_id)
+    job = runner_service.get_status(job_id)
     if not job:
         return JSONResponse(
             status_code=404,
             content={"message": "Job not found"},
         )
+
+    # Use full logs from disk for completed jobs (in-memory may be capped)
+    stdout, stderr = runner_service.store.get_full_logs(job_id)
+
     return JSONResponse(
         status_code=200,
         content={
-            "start_time": job["start_time"].strftime("%Y-%m-%d %H:%M:%S"),
-            "cmd": job["cmd"],
-            "duration": job["duration"],
-            "end_time": (
-                job["end_time"].strftime("%Y-%m-%d %H:%M:%S")
-                if job["end_time"]
-                else None
-            ),
-            "status": job["status"],
-            "stdout": job["stdout"],
-            "stderr": job["stderr"],
-            "returncode": job["returncode"],
+            "start_time": job.start_time.isoformat(),
+            "cmd": job.cmd,
+            "duration": job.duration,
+            "end_time": job.end_time.isoformat() if job.end_time else None,
+            "status": job.status.value,
+            "stdout": stdout,
+            "stderr": stderr,
+            "returncode": job.returncode,
+            "error_summary": job.error_summary,
         },
     )
 
@@ -310,30 +259,153 @@ async def get_kedro_command_status(job_id: str):
 @router.post("/kedro-command-cancel/{job_id}")
 async def cancel_kedro_command(job_id: str):
     """Attempt to terminate a running Kedro command."""
-    with _kedro_jobs_lock:
-        job = kedro_jobs.get(job_id)
-        if not job:
-            return JSONResponse(status_code=404, content={"message": "Job not found"})
-        pid = job.get("pid")
-        status = job.get("status")
-    if not pid or status not in {"initialize", "running"}:
-        # Nothing to do; treat as success for idempotency
-        return JSONResponse(status_code=200, content={"terminated": False})
+    result = runner_service.cancel_run(job_id)
+    if result is None:
+        return JSONResponse(status_code=404, content={"message": "Job not found"})
 
+    return JSONResponse(status_code=200, content={"terminated": result})
+
+
+@router.post("/run")
+async def start_run(config: RunConfig, background_tasks: BackgroundTasks):
+    """Start a validated pipeline run from a structured config.
+
+    This is the primary endpoint for starting pipeline runs. It accepts
+    a structured RunConfig JSON body and returns the created job.
+
+    Frontend contract:
+        Request:  POST /api/run  { pipeline?, env?, tags?, from_nodes?, to_nodes?, params? }
+        Response: 202 { "job_id": "<uuid>", "status": "initialize" }
+        Error:    400 { "message": "...", "errors": [...] }
+        Conflict: 409 { "message": "A run is already active", "active_job_id": "...", "started_at": "..." }
+
+    The response shape (job_id + status) is compatible with the frontend's
+    runner-api.js expectations.
+    """
     try:
-        # On Windows, SIGTERM maps to TerminateProcess; on Unix it's a soft terminate
-        os.kill(pid, signal.SIGTERM)
-        with _kedro_jobs_lock:
-            job = kedro_jobs.get(job_id)
-            if job:
-                job["status"] = "terminated"
-                job["end_time"] = datetime.now()
-                if job.get("start_time"):
-                    job["duration"] = (job["end_time"] - job["start_time"]).total_seconds()
-        return JSONResponse(status_code=200, content={"terminated": True})
-    except Exception as exc:  # pragma: no cover
-        logger.exception("Failed to terminate Kedro job %s: %s", job_id, exc)
-        return JSONResponse(status_code=500, content={"message": str(exc)})
+        job, cmd = runner_service.start_run(config)
+    except ActiveJobError as exc:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "message": "A run is already active",
+                "active_job_id": exc.active_job_id,
+                "started_at": exc.started_at.isoformat(),
+            },
+        )
+    except ValueError as exc:
+        return JSONResponse(
+            status_code=400,
+            content={"message": "Validation failed", "errors": str(exc).split("; ")},
+        )
+
+    background_tasks.add_task(runner_service.executor.start, job.job_id, cmd)
+    return JSONResponse(
+        status_code=202,
+        content={"job_id": job.job_id, "status": "initialize"},
+    )
+
+
+@router.get("/run-history")
+async def get_run_history(limit: int = 50):
+    """Get metadata for recent pipeline runs."""
+    jobs = runner_service.get_history(limit)
+    return JSONResponse(
+        status_code=200,
+        content=[
+            {
+                "job_id": job.job_id,
+                "status": job.status.value,
+                "start_time": job.start_time.isoformat(),
+                "end_time": job.end_time.isoformat() if job.end_time else None,
+                "duration": job.duration,
+                "cmd": job.cmd,
+                "returncode": job.returncode,
+                "error_summary": job.error_summary,
+            }
+            for job in jobs
+        ],
+    )
+
+
+@router.get("/run-progress/{job_id}")
+async def get_run_progress(job_id: str):
+    """Get node-level progress for a running job."""
+    progress = progress_tracker.get_progress(job_id)
+    if progress is None:
+        return JSONResponse(
+            status_code=404,
+            content={"message": "Job not found or no progress available"},
+        )
+
+    result = {
+        "nodes_total": progress.nodes_total,
+        "nodes_completed": progress.nodes_completed,
+        "current_node": progress.current_node,
+        "node_events": [
+            {
+                "node_id": e.node_id,
+                "node_name": e.node_name,
+                "status": e.status,
+                "timestamp": e.timestamp.isoformat(),
+                "duration": e.duration,
+                "error": e.error,
+            }
+            for e in progress.node_events
+        ],
+    }
+    return JSONResponse(status_code=200, content=result)
+
+
+@router.get("/run-stream/{job_id}")
+async def stream_run_events(job_id: str):
+    """Stream live updates for a running job via Server-Sent Events.
+
+    Returns a StreamingResponse with media_type text/event-stream.
+    On connect, sends current state snapshot so reconnecting clients
+    are caught up. Pushes log, progress, and done events as they occur.
+    Terminates when the job reaches a terminal state.
+    """
+    job = runner_service.get_status(job_id)
+    if not job:
+        return JSONResponse(
+            status_code=404,
+            content={"message": "Job not found"},
+        )
+
+    event_queue = runner_service.executor.get_event_queue(job_id)
+
+    if event_queue is None:
+        # Job already completed — send snapshot and done
+        async def completed_stream():
+            yield SSEFormatter.status_event(job.status.value, job.error_summary)
+            yield SSEFormatter.done_event(
+                job.status.value, job.duration, job.returncode, job.error_summary
+            )
+
+        return StreamingResponse(completed_stream(), media_type="text/event-stream")
+
+    async def event_generator():
+        """Async generator that reads from the event queue."""
+        # Send initial status snapshot
+        yield SSEFormatter.status_event(job.status.value, job.error_summary)
+
+        try:
+            while True:
+                try:
+                    # Use asyncio-friendly polling to avoid blocking the event loop
+                    event = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: event_queue.get(timeout=1)
+                    )
+                    if event is None:  # Sentinel: stream closed
+                        break
+                    yield event
+                except queue.Empty:
+                    continue
+        except asyncio.CancelledError:
+            pass  # Client disconnected
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @router.get(

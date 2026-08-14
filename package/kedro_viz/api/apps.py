@@ -2,7 +2,9 @@
 This data could either come from a real Kedro project or a file.
 """
 
+import atexit
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -18,9 +20,41 @@ from kedro_viz import __version__
 from kedro_viz.api.rest.responses.utils import EnhancedORJSONResponse
 from kedro_viz.integrations.kedro import telemetry as kedro_telemetry
 
-from .rest.router import router as rest_router
+from .rest.router import router as rest_router, job_store, executor
+
+logger = logging.getLogger(__name__)
 
 _HTML_DIR = Path(__file__).parent.parent.absolute() / "html"
+
+
+def _register_shutdown_handlers():
+    """Register shutdown handlers to gracefully terminate active runs.
+
+    On shutdown: terminates any active subprocess, marks the job as
+    'interrupted', and flushes logs to disk (handled by the store's
+    persistence layer).
+    """
+
+    def _shutdown():
+        active_job = job_store.get_active_job()
+        if active_job:
+            logger.info(
+                "Shutting down: terminating active job %s", active_job.job_id
+            )
+            executor.terminate(active_job.job_id)
+            # If terminate didn't change status (e.g. no PID yet), mark interrupted
+            from kedro_viz.api.rest.runner.models import JobStatus
+
+            refreshed = job_store.get_job(active_job.job_id)
+            if refreshed and refreshed.status in (
+                JobStatus.INITIALIZE,
+                JobStatus.RUNNING,
+            ):
+                job_store.update_job(
+                    active_job.job_id, status=JobStatus.INTERRUPTED
+                )
+
+    atexit.register(_shutdown)
 
 
 def _create_etag() -> str:
@@ -62,6 +96,7 @@ def create_api_app_from_project(
     """
     app = _create_base_api_app()
     app.include_router(rest_router)
+    _register_shutdown_handlers()
 
     # Check for html directory existence.
     if Path(_HTML_DIR).is_dir():
